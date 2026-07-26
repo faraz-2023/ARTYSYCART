@@ -56,6 +56,12 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
     # ------------------------------------------------------------------
+    # Supabase
+    # ------------------------------------------------------------------
+    SUPABASE_URL: AnyHttpUrl | None = None
+    SUPABASE_SERVICE_ROLE_KEY: str | None = None
+
+    # ------------------------------------------------------------------
     # Server
     # ------------------------------------------------------------------
     HOST: str = "0.0.0.0"

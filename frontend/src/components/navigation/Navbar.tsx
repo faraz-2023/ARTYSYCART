@@ -1,10 +1,33 @@
 import { Link, NavLink } from "react-router-dom";
+import { useRef, useState, type ChangeEvent } from "react";
+import { toast } from "sonner";
 import { useAuth } from "@/context/AuthContext";
 import { Button } from "@/components/ui/button";
 import { UserCircle } from "lucide-react";
 
 export function Navbar() {
-  const { isAuthenticated, user, logout } = useAuth();
+  const { isAuthenticated, user, logout, uploadProfileImage } = useAuth();
+  const [isUploadingImage, setIsUploadingImage] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const handleProfileImageChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const selectedFile = event.target.files?.[0];
+    if (!selectedFile) {
+      return;
+    }
+
+    try {
+      setIsUploadingImage(true);
+      await uploadProfileImage(selectedFile);
+      toast.success("Profile image updated.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to upload image.";
+      toast.error(message);
+    } finally {
+      setIsUploadingImage(false);
+      event.target.value = "";
+    }
+  };
 
   return (
     <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
@@ -35,10 +58,33 @@ export function Navbar() {
         <div className="flex items-center gap-3">
           {isAuthenticated ? (
             <>
-              <span className="hidden sm:flex items-center gap-1.5 text-sm text-muted-foreground">
-                <UserCircle className="h-4 w-4" />
+              <span className="hidden sm:flex items-center gap-2 text-sm text-muted-foreground">
+                {user?.profile_image ? (
+                  <img
+                    src={user.profile_image}
+                    alt={`${user.full_name} profile`}
+                    className="h-7 w-7 rounded-full object-cover border"
+                  />
+                ) : (
+                  <UserCircle className="h-5 w-5" />
+                )}
                 {user?.full_name}
               </span>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={handleProfileImageChange}
+              />
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => fileInputRef.current?.click()}
+                isLoading={isUploadingImage}
+              >
+                Upload photo
+              </Button>
               <Button
                 variant="outline"
                 size="sm"

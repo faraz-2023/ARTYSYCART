@@ -7,7 +7,9 @@ import {
   type ReactNode,
 } from "react";
 import { useNavigate } from "react-router-dom";
-import apiClient, { tokenStorage } from "@/services/apiClient";
+import type { Session, User as SupabaseUser } from "@supabase/supabase-js";
+import { supabase } from "@/lib/supabase";
+import { uploadProfileImageToStorage } from "@/services/storage";
 import type {
   AuthState,
   AuthTokens,
@@ -63,6 +65,7 @@ interface AuthContextValue extends AuthState {
   login: (payload: LoginPayload) => Promise<void>;
   register: (payload: RegisterPayload) => Promise<void>;
   logout: () => Promise<void>;
+  uploadProfileImage: (file: File) => Promise<string>;
   updateUser: (user: User) => void;
 }
 
@@ -79,40 +82,90 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [state, dispatch] = useReducer(authReducer, initialState);
   const navigate = useNavigate();
 
-  // Listen for forced logout triggered by the Axios refresh interceptor
-  useEffect(() => {
-    const handleForcedLogout = () => {
-      dispatch({ type: "LOGOUT" });
-      navigate("/login", { replace: true });
+  const mapTokensFromSession = useCallback((session: Session): AuthTokens => {
+    return {
+      access_token: session.access_token,
+      refresh_token: session.refresh_token ?? "",
+      token_type: "bearer",
     };
-    window.addEventListener("auth:logout", handleForcedLogout);
-    return () => window.removeEventListener("auth:logout", handleForcedLogout);
-  }, [navigate]);
+  }, []);
 
-  // On mount, restore session from stored tokens
+  const mapUserFromSupabase = useCallback((supabaseUser: SupabaseUser): User => {
+    const meta = (supabaseUser.user_metadata ?? {}) as Record<string, unknown>;
+    const email = supabaseUser.email ?? "";
+    const fallbackName = email ? email.split("@")[0] : "User";
+    const roleValue = meta.role;
+    const role =
+      roleValue === "seller" || roleValue === "admin" || roleValue === "buyer"
+        ? roleValue
+        : "buyer";
+
+    return {
+      id: supabaseUser.id,
+      email,
+      username:
+        typeof meta.username === "string" && meta.username.trim().length > 0
+          ? meta.username
+          : fallbackName,
+      full_name:
+        typeof meta.full_name === "string" && meta.full_name.trim().length > 0
+          ? meta.full_name
+          : fallbackName,
+      role,
+      profile_image:
+        typeof meta.profile_image === "string" ? meta.profile_image : null,
+      is_active: true,
+      is_verified: Boolean(supabaseUser.email_confirmed_at),
+      created_at: supabaseUser.created_at,
+      updated_at: supabaseUser.updated_at ?? supabaseUser.created_at,
+    };
+  }, []);
+
+  // On mount, restore session and keep auth state in sync with Supabase.
   useEffect(() => {
     const restoreSession = async () => {
-      const accessToken = tokenStorage.getAccessToken();
-      if (!accessToken) {
+      const { data, error } = await supabase.auth.getSession();
+
+      if (error) {
         dispatch({ type: "AUTH_FAILURE" });
         return;
       }
-      try {
-        const { data } = await apiClient.get<User>("/auth/me");
-        const tokens: AuthTokens = {
-          access_token: accessToken,
-          refresh_token: tokenStorage.getRefreshToken() ?? "",
-          token_type: "bearer",
-        };
-        dispatch({ type: "AUTH_SUCCESS", payload: { user: data, tokens } });
-      } catch {
-        tokenStorage.clearTokens();
+
+      if (!data.session || !data.session.user) {
         dispatch({ type: "AUTH_FAILURE" });
+        return;
       }
+
+      dispatch({
+        type: "AUTH_SUCCESS",
+        payload: {
+          user: mapUserFromSupabase(data.session.user),
+          tokens: mapTokensFromSession(data.session),
+        },
+      });
     };
 
-    restoreSession();
-  }, []);
+    void restoreSession();
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!session || !session.user) {
+        dispatch({ type: "LOGOUT" });
+        return;
+      }
+
+      dispatch({
+        type: "AUTH_SUCCESS",
+        payload: {
+          user: mapUserFromSupabase(session.user),
+          tokens: mapTokensFromSession(session),
+        },
+      });
+    });
+
+    return () => subscription.unsubscribe();
+  }, [mapTokensFromSession, mapUserFromSupabase]);
 
   // ------------------------------------------------------------------
   // Login
@@ -120,15 +173,31 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const login = useCallback(async (payload: LoginPayload) => {
     dispatch({ type: "AUTH_START" });
     try {
-      const { data: tokens } = await apiClient.post<AuthTokens>("/auth/login", payload);
-      tokenStorage.setTokens(tokens.access_token, tokens.refresh_token);
-      const { data: user } = await apiClient.get<User>("/auth/me");
-      dispatch({ type: "AUTH_SUCCESS", payload: { user, tokens } });
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: payload.email,
+        password: payload.password,
+      });
+
+      if (error) {
+        throw new Error(error.message);
+      }
+
+      if (!data.session || !data.user) {
+        throw new Error("Login failed. No active session returned by Supabase.");
+      }
+
+      dispatch({
+        type: "AUTH_SUCCESS",
+        payload: {
+          user: mapUserFromSupabase(data.user),
+          tokens: mapTokensFromSession(data.session),
+        },
+      });
     } catch (error) {
       dispatch({ type: "AUTH_FAILURE" });
       throw error;
     }
-  }, []);
+  }, [mapTokensFromSession, mapUserFromSupabase]);
 
   // ------------------------------------------------------------------
   // Register
@@ -136,31 +205,80 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const register = useCallback(async (payload: RegisterPayload) => {
     dispatch({ type: "AUTH_START" });
     try {
-      const { data: tokens } = await apiClient.post<AuthTokens>("/auth/register", payload);
-      tokenStorage.setTokens(tokens.access_token, tokens.refresh_token);
-      const { data: user } = await apiClient.get<User>("/auth/me");
-      dispatch({ type: "AUTH_SUCCESS", payload: { user, tokens } });
+      const { data, error } = await supabase.auth.signUp({
+        email: payload.email,
+        password: payload.password,
+        options: {
+          data: {
+            username: payload.username,
+            full_name: payload.full_name,
+            role: payload.role,
+          },
+        },
+      });
+
+      if (error) {
+        throw new Error(error.message);
+      }
+
+      if (!data.user) {
+        throw new Error("Registration failed. Supabase did not return a user.");
+      }
+
+      if (!data.session) {
+        dispatch({ type: "AUTH_FAILURE" });
+        throw new Error("Account created. Please verify your email, then sign in.");
+      }
+
+      dispatch({
+        type: "AUTH_SUCCESS",
+        payload: {
+          user: mapUserFromSupabase(data.user),
+          tokens: mapTokensFromSession(data.session),
+        },
+      });
     } catch (error) {
       dispatch({ type: "AUTH_FAILURE" });
       throw error;
     }
-  }, []);
+  }, [mapTokensFromSession, mapUserFromSupabase]);
 
   // ------------------------------------------------------------------
   // Logout
   // ------------------------------------------------------------------
   const logout = useCallback(async () => {
-    try {
-      // Tell the server (best-effort — ignore errors, e.g. already-expired token)
-      await apiClient.post("/auth/logout");
-    } catch {
-      // silently ignore
-    } finally {
-      tokenStorage.clearTokens();
-      dispatch({ type: "LOGOUT" });
-      navigate("/login", { replace: true });
+    const { error } = await supabase.auth.signOut();
+    if (error) {
+      throw new Error(error.message);
     }
+    dispatch({ type: "LOGOUT" });
+    navigate("/login", { replace: true });
   }, [navigate]);
+
+  const uploadProfileImage = useCallback(
+    async (file: File) => {
+      if (!state.user) {
+        throw new Error("You must be signed in to upload a profile image.");
+      }
+
+      const uploadResult = await uploadProfileImageToStorage(state.user.id, file);
+      const { data, error } = await supabase.auth.updateUser({
+        data: { profile_image: uploadResult.publicUrl },
+      });
+
+      if (error) {
+        throw new Error(error.message);
+      }
+
+      if (!data.user) {
+        throw new Error("Profile image uploaded but failed to update your user profile.");
+      }
+
+      dispatch({ type: "SET_USER", payload: mapUserFromSupabase(data.user) });
+      return uploadResult.publicUrl;
+    },
+    [mapUserFromSupabase, state.user]
+  );
 
   // ------------------------------------------------------------------
   // Update user in state (e.g. after profile edit)
@@ -171,7 +289,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   return (
     <AuthContext.Provider
-      value={{ ...state, login, register, logout, updateUser }}
+      value={{ ...state, login, register, logout, uploadProfileImage, updateUser }}
     >
       {children}
     </AuthContext.Provider>

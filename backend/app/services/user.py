@@ -30,6 +30,12 @@ class UserService(BaseService[User]):
         )
         return result.scalar_one_or_none()
 
+    async def get_by_supabase_id(self, db: AsyncSession, supabase_id: str) -> User | None:
+        result = await db.execute(
+            select(User).where(User.supabase_id == supabase_id)
+        )
+        return result.scalar_one_or_none()
+
     async def email_exists(self, db: AsyncSession, email: str) -> bool:
         return await self.get_by_email(db, email) is not None
 
